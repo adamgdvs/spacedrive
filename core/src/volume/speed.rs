@@ -67,10 +67,11 @@ pub async fn run_speed_test_with_config(
 	debug!("Starting speed test with config: {:?}", config);
 
 	let test_location = TestLocation::new(&volume.mount_point, &volume.mount_type).await?;
-	let result = perform_speed_test(&test_location, &config).await?;
+	let result = perform_speed_test(&test_location, &config).await;
 
-	// Cleanup
+	// A failed or timed-out test must not leave its directory on the user's volume.
 	test_location.cleanup().await?;
+	let result = result?;
 
 	debug!(
 		"Speed test completed: {:.2} MB/s write, {:.2} MB/s read",
@@ -93,7 +94,11 @@ impl TestLocation {
 	/// Create a new test location
 	async fn new(volume_path: &std::path::Path, mount_type: &MountType) -> VolumeResult<Self> {
 		let (dir, created_dir) = get_writable_directory(volume_path, mount_type).await?;
-		let test_file = dir.join("spacedrive_speed_test.tmp");
+		// Unique so the root fallback can never overwrite a user's file.
+		let test_file = dir.join(format!(
+			".spacedrive_speed_test_{}.tmp",
+			uuid::Uuid::new_v4()
+		));
 
 		Ok(Self {
 			test_file,
@@ -110,9 +115,10 @@ impl TestLocation {
 			}
 		}
 
-		// Remove created directory if we created it
+		// Non-recursive on purpose: if the directory holds anything besides our
+		// test file, it is not ours to delete.
 		if let Some(ref dir) = self.created_dir {
-			if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+			if let Err(e) = tokio::fs::remove_dir(dir).await {
 				warn!("Failed to remove test directory: {}", e);
 			}
 		}
@@ -225,54 +231,45 @@ async fn perform_read_test(file_path: &std::path::Path, expected_size: usize) ->
 	Ok(speed_mbps)
 }
 
-/// Get a writable directory within the volume
+/// Get a writable directory within the volume.
+///
+/// Returns the directory to write in, plus the directory to remove afterwards
+/// when this call created it. Ownership is proven by `create_dir` succeeding
+/// on a fresh unique name, never inferred from a name, because the volume
+/// root holds user data: an earlier version reused `<root>/tmp` and then
+/// deleted it recursively, taking the user's own `tmp` folder with it (#3056).
 async fn get_writable_directory(
 	volume_path: &std::path::Path,
 	mount_type: &MountType,
 ) -> VolumeResult<(std::path::PathBuf, Option<std::path::PathBuf>)> {
-	match mount_type {
-		MountType::System => {
-			// For system volumes, prefer using temp directory
-			let temp_dir = std::env::temp_dir();
-			Ok((temp_dir, None))
-		}
-		_ => {
-			// For external volumes, try to write in the root or create a temp directory
-			let candidates = [
-				volume_path.join("tmp"),
-				volume_path.join(".spacedrive_temp"),
-				volume_path.to_path_buf(),
-			];
-
-			for candidate in &candidates {
-				// Try to create the directory
-				if let Ok(()) = tokio::fs::create_dir_all(candidate).await {
-					// Test if we can write to it
-					let test_file = candidate.join("test_write_permissions");
-					if tokio::fs::write(&test_file, b"test").await.is_ok() {
-						let _ = tokio::fs::remove_file(&test_file).await;
-
-						// If we created a directory specifically for this test, mark it for cleanup
-						let created_dir = if candidate
-							.file_name()
-							.map_or(false, |name| name == "tmp" || name == ".spacedrive_temp")
-						{
-							Some(candidate.clone())
-						} else {
-							None
-						};
-
-						return Ok((candidate.clone(), created_dir));
-					}
-				}
-			}
-
-			Err(VolumeError::PermissionDenied(format!(
-				"No writable directory found in volume: {}",
-				volume_path.display()
-			)))
-		}
+	if let MountType::System = mount_type {
+		return Ok((std::env::temp_dir(), None));
 	}
+
+	let owned_dir = volume_path.join(format!(".spacedrive_speed_test_{}", uuid::Uuid::new_v4()));
+	if tokio::fs::create_dir(&owned_dir).await.is_ok() {
+		if can_write(&owned_dir).await {
+			return Ok((owned_dir.clone(), Some(owned_dir)));
+		}
+		let _ = tokio::fs::remove_dir(&owned_dir).await;
+	}
+
+	// Some volumes allow file writes at the root but not new directories.
+	if can_write(volume_path).await {
+		return Ok((volume_path.to_path_buf(), None));
+	}
+
+	Err(VolumeError::PermissionDenied(format!(
+		"No writable directory found in volume: {}",
+		volume_path.display()
+	)))
+}
+
+async fn can_write(dir: &std::path::Path) -> bool {
+	let probe = dir.join(format!(".spacedrive_write_probe_{}", uuid::Uuid::new_v4()));
+	let writable = tokio::fs::write(&probe, b"test").await.is_ok();
+	let _ = tokio::fs::remove_file(&probe).await;
+	writable
 }
 
 #[cfg(test)]
@@ -329,16 +326,12 @@ mod tests {
 		assert!(created_dir.is_none()); // Should use system temp, not create new dir
 	}
 
-	#[tokio::test]
-	async fn test_full_speed_test() {
-		let temp_dir = TempDir::new().unwrap();
-
+	fn external_volume(mount_path: std::path::PathBuf) -> Volume {
 		let device_id = uuid::Uuid::new_v4();
-		let mount_path = temp_dir.path().to_path_buf();
 		let fingerprint = VolumeFingerprint::from_primary_volume(&mount_path, device_id);
 		let now = chrono::Utc::now();
 
-		let volume = Volume {
+		Volume {
 			id: uuid::Uuid::new_v4(),
 			fingerprint,
 			cloud_identifier: None,
@@ -381,19 +374,88 @@ mod tests {
 			icon: None,
 			error_message: None,
 			supports_block_cloning: false,
-		};
+		}
+	}
 
-		let config = SpeedTestConfig {
-			file_size_mb: 1, // Small test file
+	fn small_config() -> SpeedTestConfig {
+		SpeedTestConfig {
+			file_size_mb: 1,
 			timeout_secs: 10,
 			iterations: 1,
-		};
+		}
+	}
 
-		let result = run_speed_test_with_config(&volume, config).await;
-		assert!(result.is_ok());
+	fn dir_names(path: &std::path::Path) -> Vec<String> {
+		let mut names: Vec<String> = std::fs::read_dir(path)
+			.unwrap()
+			.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+			.collect();
+		names.sort();
+		names
+	}
 
-		let (read_speed, write_speed) = result.unwrap();
+	#[tokio::test]
+	async fn test_full_speed_test() {
+		let temp_dir = TempDir::new().unwrap();
+		let volume = external_volume(temp_dir.path().to_path_buf());
+
+		let (read_speed, write_speed) = run_speed_test_with_config(&volume, small_config())
+			.await
+			.unwrap();
 		assert!(read_speed > 0);
 		assert!(write_speed > 0);
+
+		assert!(
+			dir_names(temp_dir.path()).is_empty(),
+			"speed test left files behind"
+		);
+	}
+
+	// Regression for #3056: a user's root-level `tmp` folder was deleted recursively.
+	#[tokio::test]
+	async fn speed_test_preserves_existing_root_folders() {
+		let temp_dir = TempDir::new().unwrap();
+		let root = temp_dir.path();
+		for name in ["tmp", ".spacedrive_temp"] {
+			std::fs::create_dir(root.join(name)).unwrap();
+			std::fs::write(root.join(name).join("keep.txt"), b"user data").unwrap();
+		}
+		std::fs::write(root.join("spacedrive_speed_test.tmp"), b"user file").unwrap();
+
+		run_speed_test_with_config(&external_volume(root.to_path_buf()), small_config())
+			.await
+			.unwrap();
+
+		assert_eq!(
+			dir_names(root),
+			vec![".spacedrive_temp", "spacedrive_speed_test.tmp", "tmp"]
+		);
+		for name in ["tmp", ".spacedrive_temp"] {
+			assert_eq!(
+				std::fs::read(root.join(name).join("keep.txt")).unwrap(),
+				b"user data"
+			);
+		}
+		assert_eq!(
+			std::fs::read(root.join("spacedrive_speed_test.tmp")).unwrap(),
+			b"user file"
+		);
+	}
+
+	#[tokio::test]
+	async fn cleanup_never_removes_a_directory_with_other_contents() {
+		let temp_dir = TempDir::new().unwrap();
+		let location = TestLocation::new(temp_dir.path(), &MountType::External)
+			.await
+			.unwrap();
+		let dir = location
+			.created_dir
+			.clone()
+			.expect("test owns a fresh directory");
+		std::fs::write(dir.join("unexpected.txt"), b"not ours").unwrap();
+
+		location.cleanup().await.unwrap();
+
+		assert!(dir.join("unexpected.txt").exists());
 	}
 }
